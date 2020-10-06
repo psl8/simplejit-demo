@@ -4,6 +4,8 @@ use cranelift::prelude::*;
 use cranelift_module::{DataContext, Linkage, Module};
 use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
 use frontend::*;
+use std::ffi::CString;
+use std::io::{stdout, Write};
 use std::slice;
 
 /// The basic JIT class.
@@ -25,11 +27,28 @@ pub struct JIT {
     module: Module<SimpleJITBackend>,
 }
 
+fn print_num(n: i64) -> i64 {
+    let mut stdout = stdout();
+    let mut had_error = writeln!(stdout, "{}", n).is_err();
+    had_error = stdout.lock().flush().is_err() || had_error;
+    had_error as i64
+}
+
 impl JIT {
     /// Create a new `JIT` instance.
     pub fn new() -> Self {
-        let builder = SimpleJITBuilder::new(cranelift_module::default_libcall_names());
-        let module = Module::new(builder);
+        let mut builder = SimpleJITBuilder::new(cranelift_module::default_libcall_names());
+        let addr = print_num as *const u8;
+        builder.symbol("print_num", addr);
+
+        let mut module = Module::new(builder);
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        module
+            .declare_function("print_num", Linkage::Import, &sig)
+            .unwrap();
+
         Self {
             builder_context: FunctionBuilderContext::new(),
             ctx: module.make_context(),
@@ -40,13 +59,41 @@ impl JIT {
 
     /// Compile a string in the toy language into machine code.
     pub fn compile(&mut self, input: &str) -> Result<*const u8, String> {
+        let module = parse(&input)?;
+        for (i, s) in module.strings.iter().enumerate() {
+            self.create_data(
+                &format!("//s{}//", i),
+                CString::new(s.as_str()).unwrap().into_bytes(),
+            )?;
+        }
+
+        let mut main = None;
+        for func in module.functions {
+            if func.name == "main" {
+                main = Some(self.compile_func(func)?)
+            } else {
+                self.compile_func(func)?;
+            }
+        }
+
+        match main {
+            Some(ptr) => Ok(ptr),
+            None => Err("no main function in module".to_owned()),
+        }
+    }
+
+    /// Compile a string in the toy language into machine code.
+    fn compile_func(&mut self, func: Function) -> Result<*const u8, String> {
         // First, parse the string, producing AST nodes.
-        let (name, params, the_return, stmts) =
-            parser::function(&input).map_err(|e| e.to_string())?;
+        let Function {
+            name,
+            params,
+            the_return,
+            stmts,
+        } = func;
 
         // Then, translate the AST nodes into Cranelift IR.
-        self.translate(params, the_return, stmts)
-            .map_err(|e| e.to_string())?;
+        self.translate(params, the_return, stmts)?;
 
         // Next, declare the function to simplejit. Functions must be declared
         // before they can be called, or defined.
@@ -186,9 +233,14 @@ impl<'a> FunctionTranslator<'a> {
     /// can then use these references in other instructions.
     fn translate_expr(&mut self, expr: Expr) -> Value {
         match expr {
-            Expr::Literal(literal) => {
+            Expr::Number(literal) => {
                 let imm: i32 = literal.parse().unwrap();
                 self.builder.ins().iconst(self.int, i64::from(imm))
+            }
+
+            Expr::String(idx) => {
+                let name = format!("//s{}//", idx);
+                self.translate_global_data_addr(name)
             }
 
             Expr::Add(lhs, rhs) => {
